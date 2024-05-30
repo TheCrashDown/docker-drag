@@ -15,6 +15,12 @@ if len(sys.argv) != 2:
     print("Usage:\n\tdocker_pull.py [registry/][repository/]image[:tag|@digest]\n")
     exit(1)
 
+DEFAULT_REGISTRY = "mirror.gcr.io"
+DEFAULT_AUTH_URL = "https://mirror.gcr.io/v2/token"
+
+MANIFEST_V2 = "application/vnd.docker.distribution.manifest.v2+json"
+MANIFEST_V2_LIST = "application/vnd.docker.distribution.manifest.list.v2+json"
+
 # Look for the Docker image to download
 repo = "library"
 tag = "latest"
@@ -26,12 +32,13 @@ except ValueError:
         img, tag = imgparts[-1].split(":")
     except ValueError:
         img = imgparts[-1]
+
 # Docker client doesn't seem to consider the first element as a potential registry unless there is a '.' or ':'
 if len(imgparts) > 1 and ("." in imgparts[0] or ":" in imgparts[0]):
     registry = imgparts[0]
     repo = "/".join(imgparts[1:-1])
 else:
-    registry = "mirror.gcr.io"
+    registry = DEFAULT_REGISTRY
     if len(imgparts[:-1]) != 0:
         repo = "/".join(imgparts[:-1])
     else:
@@ -39,7 +46,7 @@ else:
 repository = "{}/{}".format(repo, img)
 
 # Get Docker authentication endpoint when it is required
-auth_url = "https://mirror.gcr.io/v2/token"
+auth_url = DEFAULT_AUTH_URL
 reg_service = "registry.docker.io"
 resp = requests.get("https://{}/v2/".format(registry), verify=False)
 if resp.status_code == 401:
@@ -75,8 +82,26 @@ def progress_bar(ublob, nb_traits):
     sys.stdout.flush()
 
 
+def get_manifest_digest(manifest):
+    """Return digest. Linux/amd64 is prioritized."""
+
+    for manifest in manifests:
+        if (
+            manifest["platform"]["architecture"] == "amd64"
+            and manifest["platform"]["os"] == "linux"
+        ):
+            return manifest["digest"]
+    for manifest in manifests:
+        if manifest["platform"]["os"] == "linux" and "64" in manifest["platform"]["architecture"]:
+            return manifest["digest"]
+    for manifest in manifests:
+        if manifest["platform"]["os"] == "linux":
+            return manifest["digest"]
+    return manifests[0]["digest"]
+
+
 # Fetch manifest LIST first (mirror.gcr.io uses this version of manifest)
-auth_head = get_auth_head("application/vnd.docker.distribution.manifest.list.v2+json")
+auth_head = get_auth_head(MANIFEST_V2_LIST)
 resp = requests.get(
     "https://{}/v2/{}/manifests/{}".format(registry, repository, tag),
     headers=auth_head,
@@ -85,7 +110,7 @@ resp = requests.get(
 if resp.status_code != 200:
     print("[-] Cannot fetch manifest for {} [HTTP {}]".format(repository, resp.status_code))
     print(resp.content)
-    auth_head = get_auth_head("application/vnd.docker.distribution.manifest.list.v2+json")
+    auth_head = get_auth_head(MANIFEST_V2_LIST)
     resp = requests.get(
         "https://{}/v2/{}/manifests/{}".format(registry, repository, tag),
         headers=auth_head,
@@ -104,24 +129,13 @@ if resp.status_code != 200:
 manifests = resp.json()["manifests"]
 
 if len(manifests) == 0:
-    print("Image not found(((")
+    print("No download manifests found for this widget(((")
     exit(1)
 
-digest = ""
-for manifest in manifests:
-    if manifest["platform"]["architecture"] == "amd64" and manifest["platform"]["os"] == "linux":
-        digest = manifest["digest"]
-        break
-if not digest:
-    for manifest in manifests:
-        if manifest["platform"]["os"] == "linux":
-            digest = manifest["digest"]
-            break
-if not digest:
-    digest = manifests[0]["digest"]
+digest = get_manifest_digest(manifests)
 
 # now we know the digest, fetch manifest for it
-auth_head = get_auth_head("application/vnd.docker.distribution.manifest.v2+json")
+auth_head = get_auth_head(MANIFEST_V2)
 resp = requests.get(
     "https://{}/v2/{}/manifests/{}".format(registry, repository, digest),
     headers=auth_head,
@@ -173,9 +187,7 @@ for layer in layers:
     # Creating layer.tar file
     sys.stdout.write(ublob[7:19] + ": Downloading...")
     sys.stdout.flush()
-    auth_head = get_auth_head(
-        "application/vnd.docker.distribution.manifest.v2+json"
-    )  # refreshing token to avoid its expiration
+    auth_head = get_auth_head(MANIFEST_V2)  # refreshing token to avoid its expiration
     bresp = requests.get(
         "https://{}/v2/{}/blobs/{}".format(registry, repository, ublob),
         headers=auth_head,
@@ -186,7 +198,7 @@ for layer in layers:
         bresp = requests.get(layer["urls"][0], headers=auth_head, stream=True, verify=False)
         if bresp.status_code != 200:
             print(
-                "\rERROR: Cannot download layer {} [HTTP {}]".format(
+                "\rERROR: Cannot download layer {} [HTTP {}] {}".format(
                     ublob[7:19], bresp.status_code, bresp.headers["Content-Length"]
                 )
             )
@@ -221,19 +233,13 @@ for layer in layers:
 
     # Creating json file
     file = open(layerdir + "/json", "w")
-    # last layer = config manifest - history - rootfs
     if layers[-1]["digest"] == layer["digest"]:
-        # FIXME: json.loads() automatically converts to unicode, thus decoding values whereas Docker doesn't
-        json_obj = json.loads(confresp.content)
-        try:
-            del json_obj["history"]
-        except:
-            pass
+        json_obj = json.loads(confresp.content.decode("utf-8"))
+        del json_obj["history"]
         try:
             del json_obj["rootfs"]
         except:  # Because Microsoft loves case insensitiveness
             del json_obj["rootfS"]
-            pass
     else:  # other layers json are empty
         json_obj = json.loads(empty_json)
     json_obj["id"] = fake_layerid
