@@ -31,7 +31,7 @@ if len(imgparts) > 1 and ("." in imgparts[0] or ":" in imgparts[0]):
     registry = imgparts[0]
     repo = "/".join(imgparts[1:-1])
 else:
-    registry = "registry-1.docker.io"
+    registry = "mirror.gcr.io"
     if len(imgparts[:-1]) != 0:
         repo = "/".join(imgparts[:-1])
     else:
@@ -39,7 +39,7 @@ else:
 repository = "{}/{}".format(repo, img)
 
 # Get Docker authentication endpoint when it is required
-auth_url = "https://auth.docker.io/token"
+auth_url = "https://mirror.gcr.io/v2/token"
 reg_service = "registry.docker.io"
 resp = requests.get("https://{}/v2/".format(registry), verify=False)
 if resp.status_code == 401:
@@ -75,8 +75,8 @@ def progress_bar(ublob, nb_traits):
     sys.stdout.flush()
 
 
-# Fetch manifest v2 and get image layer digests
-auth_head = get_auth_head("application/vnd.docker.distribution.manifest.v2+json")
+# Fetch manifest LIST first (mirror.gcr.io uses this version of manifest)
+auth_head = get_auth_head("application/vnd.docker.distribution.manifest.list.v2+json")
 resp = requests.get(
     "https://{}/v2/{}/manifests/{}".format(registry, repository, tag),
     headers=auth_head,
@@ -101,11 +101,37 @@ if resp.status_code != 200:
                 sys.stdout.write("{}: {}, ".format(key, value))
             print("digest: {}".format(manifest["digest"]))
     exit(1)
+manifests = resp.json()["manifests"]
+
+if len(manifests) == 0:
+    print("Image not found(((")
+    exit(1)
+
+digest = ""
+for manifest in manifests:
+    if manifest["platform"]["architecture"] == "amd64" and manifest["platform"]["os"] == "linux":
+        digest = manifest["digest"]
+        break
+if not digest:
+    for manifest in manifests:
+        if manifest["platform"]["os"] == "linux":
+            digest = manifest["digest"]
+            break
+if not digest:
+    digest = manifests[0]["digest"]
+
+# now we know the digest, fetch manifest for it
+auth_head = get_auth_head("application/vnd.docker.distribution.manifest.v2+json")
+resp = requests.get(
+    "https://{}/v2/{}/manifests/{}".format(registry, repository, digest),
+    headers=auth_head,
+    verify=False,
+)
 layers = resp.json()["layers"]
 
 # Create tmp folder that will hold the image
 imgdir = "tmp_{}_{}".format(img, tag.replace(":", "@"))
-os.mkdir(imgdir)
+os.makedirs(imgdir, exist_ok=True)
 print("Creating image structure in: " + imgdir)
 
 config = resp.json()["config"]["digest"]
@@ -126,8 +152,8 @@ else:
 
 empty_json = (
     '{"created":"1970-01-01T00:00:00Z","container_config":{"Hostname":"","Domainname":"","User":"","AttachStdin":false, \
-	"AttachStdout":false,"AttachStderr":false,"Tty":false,"OpenStdin":false, "StdinOnce":false,"Env":null,"Cmd":null,"Image":"", \
-	"Volumes":null,"WorkingDir":"","Entrypoint":null,"OnBuild":null,"Labels":null}}'
+    "AttachStdout":false,"AttachStderr":false,"Tty":false,"OpenStdin":false, "StdinOnce":false,"Env":null,"Cmd":null,"Image":"", \
+    "Volumes":null,"WorkingDir":"","Entrypoint":null,"OnBuild":null,"Labels":null}}'
 )
 
 # Build layer folders
@@ -199,11 +225,15 @@ for layer in layers:
     if layers[-1]["digest"] == layer["digest"]:
         # FIXME: json.loads() automatically converts to unicode, thus decoding values whereas Docker doesn't
         json_obj = json.loads(confresp.content)
-        del json_obj["history"]
+        try:
+            del json_obj["history"]
+        except:
+            pass
         try:
             del json_obj["rootfs"]
         except:  # Because Microsoft loves case insensitiveness
             del json_obj["rootfS"]
+            pass
     else:  # other layers json are empty
         json_obj = json.loads(empty_json)
     json_obj["id"] = fake_layerid
