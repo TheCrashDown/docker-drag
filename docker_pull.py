@@ -82,7 +82,7 @@ def progress_bar(ublob, nb_traits):
     sys.stdout.flush()
 
 
-def get_manifest_digest(manifest):
+def get_manifest_digest(manifests):
     """Return digest. Linux/amd64 is prioritized."""
 
     for manifest in manifests:
